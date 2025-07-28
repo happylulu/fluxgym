@@ -210,6 +210,9 @@ def load_captioning(uploaded_files, concept_sentence):
         # Update value of captioning area
         text_value = corresponding_caption if visible and corresponding_caption else concept_sentence if visible and concept_sentence else None
         updates.append(gr.update(value=text_value, visible=visible))
+        
+        # Update for caption_stats component - this was missing!
+        updates.append(gr.update(visible=visible))
 
     # Update for the sample caption area
     updates.append(gr.update(visible=True))
