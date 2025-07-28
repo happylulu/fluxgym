@@ -254,7 +254,10 @@ def load_captioning(uploaded_files, concept_sentence):
 
     # Update for the start button
     updates.append(gr.update(visible=True))
-
+    
+    print(f"DEBUG: load_captioning returning {len(updates)} updates")
+    print(f"DEBUG: Expected structure: 1 (captioning_area) + {MAX_IMAGES}*4 (images) + 1 (start) = {1 + MAX_IMAGES*4 + 1}")
+    
     return updates
 
 def hide_captioning():
@@ -1549,6 +1552,9 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
     ]
     advanced_component_ids = [x.elem_id for x in advanced_components]
     original_advanced_component_values = [comp.value for comp in advanced_components]
+    
+    print(f"DEBUG: output_components has {len(output_components)} elements")
+    
     images.upload(
         load_captioning,
         inputs=[images, concept_sentence],
