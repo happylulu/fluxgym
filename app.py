@@ -219,7 +219,6 @@ def load_captioning(uploaded_files, concept_sentence):
             if os.path.exists(image_path):
                 # Read the image using PIL to ensure it's valid
                 try:
-                    from PIL import Image
                     img = Image.open(image_path)
                     # Convert to RGB if needed
                     if img.mode not in ('RGB', 'RGBA'):
@@ -255,8 +254,18 @@ def load_captioning(uploaded_files, concept_sentence):
     # Update for the start button
     updates.append(gr.update(visible=True))
     
-    print(f"DEBUG: load_captioning returning {len(updates)} updates")
-    print(f"DEBUG: Expected structure: 1 (captioning_area) + {MAX_IMAGES}*4 (images) + 1 (start) = {1 + MAX_IMAGES*4 + 1}")
+    # Debug: Count updates by type
+    print(f"DEBUG: Total updates: {len(updates)}")
+    print(f"DEBUG: Number of uploaded images: {len(uploaded_images)}")
+    print(f"DEBUG: Updates breakdown:")
+    print(f"  - captioning_area: 1")
+    print(f"  - image components: {MAX_IMAGES * 4}")
+    print(f"  - start button: 1")
+    print(f"  - Total expected: {1 + MAX_IMAGES * 4 + 1} = 602")
+    
+    # Let's verify we have exactly 4 updates per image
+    updates_per_image = (len(updates) - 2) / MAX_IMAGES  # subtract captioning_area and start
+    print(f"DEBUG: Updates per image: {updates_per_image}")
     
     return updates
 
@@ -1552,9 +1561,6 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
     ]
     advanced_component_ids = [x.elem_id for x in advanced_components]
     original_advanced_component_values = [comp.value for comp in advanced_components]
-    
-    print(f"DEBUG: output_components has {len(output_components)} elements")
-    
     images.upload(
         load_captioning,
         inputs=[images, concept_sentence],
