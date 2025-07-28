@@ -12,6 +12,7 @@ import uuid
 import shutil
 import json
 import yaml
+import time
 from slugify import slugify
 from transformers import AutoProcessor, AutoModelForCausalLM
 from gradio_logsview import LogsView, LogsViewRunner
@@ -21,6 +22,9 @@ from argparse import Namespace
 import train_network
 import toml
 import re
+import asyncio
+from training_monitor import TrainingMonitor
+from caption_utils import CaptionReviewer, CaptionModelManager
 MAX_IMAGES = 150
 
 with open('models.yaml', 'r') as file:
@@ -267,50 +271,156 @@ def create_dataset(destination_folder, size, *inputs):
     return destination_folder
 
 
-def run_captioning(images, concept_sentence, *captions):
-    print(f"run_captioning")
+def run_captioning(images, concept_sentence, model_choice, *captions):
+    print(f"run_captioning with model: {model_choice}")
     print(f"concept sentence {concept_sentence}")
     print(f"captions {captions}")
-    #Load internally to not consume resources for training
+    
+    manager = CaptionModelManager()
+    manager.set_current_model(model_choice)
+    
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device={device}")
     torch_dtype = torch.float16
-    model = AutoModelForCausalLM.from_pretrained(
-        "multimodalart/Florence-2-large-no-flash-attn", torch_dtype=torch_dtype, trust_remote_code=True
-    ).to(device)
-    processor = AutoProcessor.from_pretrained("multimodalart/Florence-2-large-no-flash-attn", trust_remote_code=True)
+    
+    start_time = time.time()
+    
+    # Load model based on choice
+    model = None
+    processor = None
+    
+    try:
+        if model_choice == "florence2":
+            model = AutoModelForCausalLM.from_pretrained(
+                "multimodalart/Florence-2-large-no-flash-attn", torch_dtype=torch_dtype, trust_remote_code=True
+            ).to(device)
+            processor = AutoProcessor.from_pretrained("multimodalart/Florence-2-large-no-flash-attn", trust_remote_code=True)
+        elif model_choice == "joycaption":
+            # JoyCaption - Using Llava-based model
+            from transformers import LlavaForConditionalGeneration, AutoProcessor
+            gr.Info("Loading JoyCaption model... This may take a moment.")
+            
+            # Using llava-1.5 as JoyCaption base
+            model_id = "llava-hf/llava-1.5-7b-hf"
+            processor = AutoProcessor.from_pretrained(model_id)
+            model = LlavaForConditionalGeneration.from_pretrained(
+                model_id,
+                torch_dtype=torch_dtype,
+                low_cpu_mem_usage=True
+            ).to(device)
+            
+        elif model_choice == "blip2":
+            from transformers import Blip2Processor, Blip2ForConditionalGeneration
+            gr.Info("Loading BLIP-2 model...")
+            
+            processor = Blip2Processor.from_pretrained("Salesforce/blip2-opt-2.7b")
+            model = Blip2ForConditionalGeneration.from_pretrained(
+                "Salesforce/blip2-opt-2.7b",
+                torch_dtype=torch_dtype
+            ).to(device)
+        else:
+            # Default to Florence-2
+            gr.Info(f"Model {model_choice} not configured, using Florence-2")
+            model = AutoModelForCausalLM.from_pretrained(
+                "multimodalart/Florence-2-large-no-flash-attn", torch_dtype=torch_dtype, trust_remote_code=True
+            ).to(device)
+            processor = AutoProcessor.from_pretrained("multimodalart/Florence-2-large-no-flash-attn", trust_remote_code=True)
+            model_choice = "florence2"
+    except Exception as e:
+        print(f"Error loading {model_choice}: {str(e)}")
+        gr.Info(f"Error loading {model_choice}, falling back to Florence-2")
+        # Fallback to Florence-2
+        model = AutoModelForCausalLM.from_pretrained(
+            "multimodalart/Florence-2-large-no-flash-attn", torch_dtype=torch_dtype, trust_remote_code=True
+        ).to(device)
+        processor = AutoProcessor.from_pretrained("multimodalart/Florence-2-large-no-flash-attn", trust_remote_code=True)
+        model_choice = "florence2"
 
     captions = list(captions)
     for i, image_path in enumerate(images):
-        print(captions[i])
+        print(f"Processing image {i+1}/{len(images)}")
         if isinstance(image_path, str):  # If image is a file path
             image = Image.open(image_path).convert("RGB")
 
-        prompt = "<DETAILED_CAPTION>"
-        inputs = processor(text=prompt, images=image, return_tensors="pt").to(device, torch_dtype)
-        print(f"inputs {inputs}")
-
-        generated_ids = model.generate(
-            input_ids=inputs["input_ids"], pixel_values=inputs["pixel_values"], max_new_tokens=1024, num_beams=3
-        )
-        print(f"generated_ids {generated_ids}")
-
-        generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
-        print(f"generated_text: {generated_text}")
-        parsed_answer = processor.post_process_generation(
-            generated_text, task=prompt, image_size=(image.width, image.height)
-        )
-        print(f"parsed_answer = {parsed_answer}")
-        caption_text = parsed_answer["<DETAILED_CAPTION>"].replace("The image shows ", "")
-        print(f"caption_text = {caption_text}, concept_sentence={concept_sentence}")
-        if concept_sentence:
-            caption_text = f"{concept_sentence} {caption_text}"
+        image_start = time.time()
+        caption_text = ""
+        
+        try:
+            if model_choice == "florence2":
+                prompt = "<DETAILED_CAPTION>"
+                inputs = processor(text=prompt, images=image, return_tensors="pt").to(device, torch_dtype)
+                
+                generated_ids = model.generate(
+                    input_ids=inputs["input_ids"], 
+                    pixel_values=inputs["pixel_values"], 
+                    max_new_tokens=1024, 
+                    num_beams=3
+                )
+                
+                generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+                parsed_answer = processor.post_process_generation(
+                    generated_text, task=prompt, image_size=(image.width, image.height)
+                )
+                caption_text = parsed_answer["<DETAILED_CAPTION>"].replace("The image shows ", "")
+                
+            elif model_choice == "joycaption":
+                # JoyCaption-style prompt for neutral, training-optimized captions
+                prompt = "USER: <image>\nDescribe this image focusing on visual elements, composition, style, and details without emotional interpretation.\nASSISTANT:"
+                
+                inputs = processor(text=prompt, images=image, return_tensors="pt").to(device)
+                if hasattr(inputs, 'pixel_values') and inputs.pixel_values.dtype != torch_dtype:
+                    inputs['pixel_values'] = inputs['pixel_values'].to(torch_dtype)
+                
+                generated_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=200,
+                    do_sample=True,
+                    temperature=0.5,
+                    top_p=0.95,
+                    repetition_penalty=1.1
+                )
+                
+                caption_text = processor.decode(generated_ids[0], skip_special_tokens=True)
+                # Extract only the assistant's response
+                if "ASSISTANT:" in caption_text:
+                    caption_text = caption_text.split("ASSISTANT:")[-1].strip()
+                # Clean up any remaining prompt artifacts
+                caption_text = caption_text.replace("USER:", "").replace("<image>", "").strip()
+                
+            elif model_choice == "blip2":
+                prompt = "Describe this image in detail:"
+                inputs = processor(images=image, text=prompt, return_tensors="pt").to(device, torch_dtype)
+                
+                generated_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=256,
+                    num_beams=3
+                )
+                
+                caption_text = processor.decode(generated_ids[0], skip_special_tokens=True)
+                
+        except Exception as e:
+            print(f"Error generating caption: {str(e)}")
+            caption_text = "Error generating caption"
+        
+        image_time = time.time() - image_start
+        manager.record_inference_time(image_time)
+        
+        print(f"Generated caption: {caption_text}")
+        if concept_sentence and concept_sentence not in caption_text:
+            caption_text = f"{concept_sentence}, {caption_text}"
         captions[i] = caption_text
 
         yield captions
-    model.to("cpu")
-    del model
-    del processor
+        
+    total_time = time.time() - start_time
+    gr.Info(f"Caption generation completed in {total_time:.1f}s (avg: {manager.get_avg_inference_time():.1f}s per image)")
+    
+    if model:
+        model.to("cpu")
+        del model
+    if processor:
+        del processor
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -566,6 +676,125 @@ def get_samples(lora_name):
     except:
         return []
 
+async def start_training_async(
+    base_model,
+    lora_name,
+    train_script,
+    train_config,
+    sample_prompts,
+    progress_bar,
+    gpu_status,
+):
+    """Async training with real-time monitoring"""
+    # write custom script and toml
+    if not os.path.exists("models"):
+        os.makedirs("models", exist_ok=True)
+    if not os.path.exists("outputs"):
+        os.makedirs("outputs", exist_ok=True)
+    output_name = slugify(lora_name)
+    output_dir = resolve_path_without_quotes(f"outputs/{output_name}")
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+
+    download(base_model)
+
+    file_type = "sh"
+    if sys.platform == "win32":
+        file_type = "bat"
+
+    sh_filename = f"train.{file_type}"
+    sh_filepath = resolve_path_without_quotes(f"outputs/{output_name}/{sh_filename}")
+    with open(sh_filepath, 'w', encoding="utf-8") as file:
+        file.write(train_script)
+    gr.Info(f"Generated train script at {sh_filename}")
+
+    dataset_path = resolve_path_without_quotes(f"outputs/{output_name}/dataset.toml")
+    with open(dataset_path, 'w', encoding="utf-8") as file:
+        file.write(train_config)
+    gr.Info(f"Generated dataset.toml")
+
+    sample_prompts_path = resolve_path_without_quotes(f"outputs/{output_name}/sample_prompts.txt")
+    with open(sample_prompts_path, 'w', encoding='utf-8') as file:
+        file.write(sample_prompts)
+    gr.Info(f"Generated sample_prompts.txt")
+
+    # Train with monitoring
+    if sys.platform == "win32":
+        command = sh_filepath
+    else:
+        command = f"bash \"{sh_filepath}\""
+
+    env = os.environ.copy()
+    env['PYTHONIOENCODING'] = 'utf-8'
+    env['LOG_LEVEL'] = 'DEBUG'
+    env['PYTHONUNBUFFERED'] = '1'
+
+    monitor = TrainingMonitor()
+    cwd = os.path.dirname(os.path.abspath(__file__))
+    
+    gr.Info(f"Started training")
+    
+    # Start the training process
+    proc = await monitor.run_training_with_monitoring(command, cwd, env)
+    
+    # Monitor GPU in background
+    async def gpu_monitor_task():
+        while proc.returncode is None:
+            gpu_info = await monitor.monitor_gpu()
+            monitor.gpu_usage = gpu_info['gpu_usage_percent']
+            monitor.memory_usage = gpu_info['memory_used_gb']
+            
+            # Update GPU status display
+            gpu_text = f"GPU: {gpu_info['gpu_usage_percent']:.1f}% | Memory: {gpu_info['memory_used_gb']:.1f}/{gpu_info['memory_total_gb']:.1f} GB"
+            yield gr.update(value=gpu_text), progress_bar
+            
+            await asyncio.sleep(2)  # Update every 2 seconds
+    
+    # Start GPU monitoring
+    gpu_task = asyncio.create_task(gpu_monitor_task())
+    
+    # Process output lines
+    log_output = ""
+    async for line in proc.stdout:
+        line = line.decode('utf-8', errors='ignore').strip()
+        if line:
+            log_output += line + "\n"
+            
+            # Parse training progress
+            updates = monitor.parse_training_log(line)
+            
+            if updates:
+                # Update progress bar
+                if 'progress_percent' in updates:
+                    progress = updates['progress_percent']
+                    progress_text = f"Step {monitor.current_step}/{monitor.total_steps} ({progress:.1f}%)"
+                    yield gr.update(value=progress, label=progress_text), gpu_status
+                    
+            # Yield log line
+            yield log_output, gpu_status
+    
+    # Wait for process to complete
+    await proc.wait()
+    gpu_task.cancel()
+    
+    # Generate Readme
+    config = toml.loads(train_config)
+    concept_sentence = config['datasets'][0]['subsets'][0]['class_tokens']
+    sample_prompts_path = resolve_path_without_quotes(f"outputs/{output_name}/sample_prompts.txt")
+    with open(sample_prompts_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    sample_prompts = [line.strip() for line in lines if len(line.strip()) > 0 and line[0] != "#"]
+    md = readme(base_model, lora_name, concept_sentence, sample_prompts)
+    readme_path = resolve_path_without_quotes(f"outputs/{output_name}/README.md")
+    with open(readme_path, "w", encoding="utf-8") as f:
+        f.write(md)
+
+    gr.Info(f"Training Complete. Check the outputs folder for the LoRA files.", duration=None)
+    
+    # Send completion notification
+    yield gr.update(value=100, label="Training Complete!"), gr.update(value="Training Complete!")
+
+
 def start_training(
     base_model,
     lora_name,
@@ -573,6 +802,8 @@ def start_training(
     train_config,
     sample_prompts,
 ):
+    """Wrapper to run async training in sync context"""
+    # For now, keep the original implementation as fallback
     # write custom script and toml
     if not os.path.exists("models"):
         os.makedirs("models", exist_ok=True)
@@ -616,10 +847,11 @@ def start_training(
     env = os.environ.copy()
     env['PYTHONIOENCODING'] = 'utf-8'
     env['LOG_LEVEL'] = 'DEBUG'
+    env['PYTHONUNBUFFERED'] = '1'  # Ensure unbuffered Python output
     runner = LogsViewRunner()
     cwd = os.path.dirname(os.path.abspath(__file__))
     gr.Info(f"Started training")
-    yield from runner.run_command([command], cwd=cwd)
+    yield from runner.run_command([command], cwd=cwd, env=env)
     yield runner.log(f"Runner: {runner}")
 
     # Generate Readme
@@ -699,6 +931,91 @@ def loaded():
 
 def update_sample(concept_sentence):
     return gr.update(value=concept_sentence)
+
+def update_model_info(model_key):
+    """Update model information display"""
+    manager = CaptionModelManager()
+    info = manager.get_model_info(model_key)
+    if info:
+        info_text = f"**{info['name']}**\n\n"
+        info_text += f"🕐 Avg. inference time: {info['avg_inference_time']}s\n\n"
+        info_text += f"📊 {info['accuracy']}\n\n"
+        info_text += "**Pros:**\n"
+        for pro in info['pros']:
+            info_text += f"• {pro}\n"
+        info_text += "\n**Cons:**\n"
+        for con in info['cons']:
+            info_text += f"• {con}\n"
+        return gr.update(value=info_text)
+    return gr.update(value="")
+
+def batch_find_replace(find_text, replace_text, case_sensitive, *captions):
+    """Batch find and replace in all captions"""
+    if not find_text:
+        return captions
+    
+    reviewer = CaptionReviewer()
+    updated_captions = reviewer.batch_find_replace(
+        list(captions), find_text, replace_text, case_sensitive
+    )
+    return updated_captions
+
+def remove_negative_words(concept_sentence, custom_negative, *captions):
+    """Remove negative words from all captions"""
+    reviewer = CaptionReviewer()
+    
+    # Add trigger word
+    if concept_sentence:
+        reviewer.set_trigger_words([concept_sentence])
+    
+    # Add custom negative words
+    if custom_negative:
+        custom_words = [w.strip() for w in custom_negative.split(',') if w.strip()]
+        reviewer.add_custom_negative_words(custom_words)
+    
+    # Process captions
+    updated_captions = []
+    total_removed = 0
+    
+    for caption in captions:
+        if caption:
+            negative_words = reviewer.find_negative_words(caption)
+            total_removed += len(negative_words)
+            updated_caption = reviewer.remove_negative_words(caption)
+            updated_captions.append(updated_caption)
+        else:
+            updated_captions.append(caption)
+    
+    # Update info
+    info_text = f"Removed {total_removed} negative words from captions"
+    
+    return [gr.update(value=info_text)] + updated_captions
+
+def analyze_caption(caption, concept_sentence):
+    """Analyze a single caption and return stats"""
+    if not caption:
+        return gr.update(visible=False)
+    
+    reviewer = CaptionReviewer()
+    if concept_sentence:
+        reviewer.set_trigger_words([concept_sentence])
+    
+    stats = reviewer.get_caption_stats(caption)
+    
+    stats_text = f"Words: {stats['word_count']} | "
+    stats_text += f"Characters: {stats['character_count']} | "
+    
+    if stats['negative_word_count'] > 0:
+        stats_text += f"⚠️ Negative words: {', '.join(stats['negative_words'])}"
+    else:
+        stats_text += "✓ No negative words"
+    
+    if stats['has_trigger_word']:
+        stats_text += " | ✓ Has trigger word"
+    else:
+        stats_text += " | ⚠️ Missing trigger word"
+    
+    return gr.update(value=stats_text, visible=True)
 
 def refresh_publish_tab():
     loras = get_loras()
@@ -837,6 +1154,85 @@ nav img.rotate { animation: rotate 2s linear infinite; }
 .codemirror-wrapper .cm-line { font-size: 12px !important; }
 label { font-weight: bold !important; }
 #start_training.clicked { background: silver; color: black; }
+
+/* Progress bar styling */
+.progress-bar {
+    background: linear-gradient(to right, #4CAF50, #45a049);
+    border-radius: 5px;
+}
+
+/* GPU status styling */
+.gpu-status {
+    font-family: monospace;
+    background: rgba(0, 0, 0, 0.05);
+    padding: 10px;
+    border-radius: 5px;
+    border: 1px solid rgba(0, 0, 0, 0.1);
+}
+
+/* Caption review styling */
+.caption-text textarea {
+    font-size: 14px;
+    line-height: 1.6;
+}
+
+.caption-stats {
+    font-size: 12px;
+    color: #666;
+    margin-top: 5px;
+}
+
+.model-info {
+    font-size: 13px;
+    background: rgba(0, 0, 0, 0.03);
+    padding: 10px;
+    border-radius: 5px;
+    margin-top: 10px;
+}
+
+.negative-info {
+    font-size: 12px;
+    color: #d32f2f;
+}
+
+/* Keyword highlighting */
+.highlight-trigger {
+    background-color: #ffeb3b;
+    font-weight: bold;
+    padding: 2px 4px;
+    border-radius: 3px;
+}
+
+.highlight-negative {
+    background-color: #ffcdd2;
+    color: #d32f2f;
+    padding: 2px 4px;
+    border-radius: 3px;
+}
+
+.highlight-emotion {
+    background-color: #e1bee7;
+    padding: 2px 4px;
+    border-radius: 3px;
+}
+
+.highlight-location {
+    background-color: #c5e1a5;
+    padding: 2px 4px;
+    border-radius: 3px;
+}
+
+.highlight-time {
+    background-color: #b3e5fc;
+    padding: 2px 4px;
+    border-radius: 3px;
+}
+
+.highlight-style {
+    background-color: #ffe0b2;
+    padding: 2px 4px;
+    border-radius: 3px;
+}
 """
 
 js = """
@@ -945,9 +1341,46 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
                             scale=1,
                         )
                     with gr.Group(visible=False) as captioning_area:
-                        do_captioning = gr.Button("Add AI captions with Florence-2")
+                        # Caption model selection
+                        with gr.Row():
+                            caption_model_manager = CaptionModelManager()
+                            model_choices = list(caption_model_manager.MODELS.keys())
+                            caption_model = gr.Dropdown(
+                                label="Caption Model",
+                                choices=model_choices,
+                                value="florence2",
+                                interactive=True
+                            )
+                            model_info = gr.Markdown("", elem_classes="model-info")
+                        
+                        do_captioning = gr.Button("Generate AI Captions")
+                        
+                        # Caption review tools
+                        with gr.Accordion("Caption Review Tools", open=False) as review_tools:
+                            with gr.Row():
+                                # Find and replace
+                                find_text = gr.Textbox(label="Find", placeholder="Text to find", scale=3)
+                                replace_text = gr.Textbox(label="Replace with", placeholder="Replacement text", scale=3)
+                                case_sensitive = gr.Checkbox(label="Case sensitive", value=False)
+                                batch_replace_btn = gr.Button("Replace All", scale=1)
+                            
+                            with gr.Row():
+                                # Negative word removal
+                                remove_negative_btn = gr.Button("Remove Negative Words", scale=1)
+                                negative_words_info = gr.Markdown("", elem_classes="negative-info", scale=2)
+                            
+                            with gr.Row():
+                                # Custom negative words
+                                custom_negative_words = gr.Textbox(
+                                    label="Custom negative words (comma-separated)",
+                                    placeholder="e.g., dark, gloomy, old",
+                                    scale=3
+                                )
+                                add_custom_negative_btn = gr.Button("Add Custom", scale=1)
+                        
                         output_components.append(captioning_area)
-                        #output_components = [captioning_area]
+                        
+                        # Caption display with review features
                         caption_list = []
                         for i in range(1, MAX_IMAGES + 1):
                             locals()[f"captioning_row_{i}"] = gr.Row(visible=False)
@@ -963,13 +1396,22 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
                                     show_share_button=False,
                                     show_download_button=False,
                                 )
-                                locals()[f"caption_{i}"] = gr.Textbox(
-                                    label=f"Caption {i}", scale=15, interactive=True
-                                )
+                                with gr.Column(scale=15):
+                                    locals()[f"caption_{i}"] = gr.Textbox(
+                                        label=f"Caption {i}", 
+                                        interactive=True,
+                                        elem_classes="caption-text"
+                                    )
+                                    locals()[f"caption_stats_{i}"] = gr.Markdown(
+                                        "", 
+                                        elem_classes="caption-stats",
+                                        visible=False
+                                    )
 
                             output_components.append(locals()[f"captioning_row_{i}"])
                             output_components.append(locals()[f"image_{i}"])
                             output_components.append(locals()[f"caption_{i}"])
+                            output_components.append(locals()[f"caption_stats_{i}"])
                             caption_list.append(locals()[f"caption_{i}"])
                 with gr.Column():
                     gr.Markdown(
@@ -979,6 +1421,13 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
                     refresh = gr.Button("Refresh", elem_id="refresh", visible=False)
                     start = gr.Button("Start training", visible=False, elem_id="start_training")
                     output_components.append(start)
+                    
+                    # Progress monitoring components
+                    with gr.Row():
+                        progress_bar = gr.Slider(minimum=0, maximum=100, value=0, label="Training Progress", interactive=False)
+                    with gr.Row():
+                        gpu_status = gr.Textbox(label="GPU Status", value="Waiting to start...", interactive=False)
+                    
                     train_script = gr.Textbox(label="Train script", max_lines=100, interactive=True)
                     train_config = gr.Textbox(label="Train config", max_lines=100, interactive=True)
             with gr.Accordion("Advanced options", elem_id='advanced_options', open=False):
@@ -1111,8 +1560,46 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
         ],
         outputs=terminal,
     )
-    do_captioning.click(fn=run_captioning, inputs=[images, concept_sentence] + caption_list, outputs=caption_list)
-    demo.load(fn=loaded, js=js, outputs=[hf_token, hf_login, hf_logout, repo_owner])
+    # Caption generation with model choice
+    do_captioning.click(
+        fn=run_captioning, 
+        inputs=[images, concept_sentence, caption_model] + caption_list, 
+        outputs=caption_list
+    )
+    
+    # Model info update
+    caption_model.change(
+        fn=update_model_info,
+        inputs=[caption_model],
+        outputs=[model_info]
+    )
+    
+    # Batch find/replace
+    batch_replace_btn.click(
+        fn=batch_find_replace,
+        inputs=[find_text, replace_text, case_sensitive] + caption_list,
+        outputs=caption_list
+    )
+    
+    # Remove negative words
+    remove_negative_btn.click(
+        fn=remove_negative_words,
+        inputs=[concept_sentence, custom_negative_words] + caption_list,
+        outputs=[negative_words_info] + caption_list
+    )
+    
+    # Analyze captions on change
+    for i in range(1, MAX_IMAGES + 1):
+        locals()[f"caption_{i}"].change(
+            fn=analyze_caption,
+            inputs=[locals()[f"caption_{i}"], concept_sentence],
+            outputs=[locals()[f"caption_stats_{i}"]]
+        )
+    demo.load(fn=loaded, js=js, outputs=[hf_token, hf_login, hf_logout, repo_owner]).then(
+        fn=update_model_info,
+        inputs=[caption_model],
+        outputs=[model_info]
+    )
     refresh.click(update, inputs=listeners, outputs=[train_script, train_config, dataset_folder])
 if __name__ == "__main__":
     cwd = os.path.dirname(os.path.abspath(__file__))
