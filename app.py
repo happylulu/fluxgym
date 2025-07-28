@@ -175,25 +175,10 @@ def upload_hf(base_model, lora_rows, repo_owner, repo_name, repo_visibility, hf_
     gr.Info(f"[Upload Complete] https://huggingface.co/{repo_id}", duration=None)
 
 def load_captioning(uploaded_files, concept_sentence):
-    # Handle both file objects and file paths
-    uploaded_images = []
-    txt_files = []
-    
-    for file in uploaded_files:
-        # Check if it's a file object or a string path
-        if hasattr(file, 'name'):
-            file_path = file.name
-        else:
-            file_path = file
-            
-        if file_path.endswith('.txt'):
-            txt_files.append(file_path)
-        else:
-            uploaded_images.append(file_path)
-    
+    uploaded_images = [file for file in uploaded_files if not file.endswith('.txt')]
+    txt_files = [file for file in uploaded_files if file.endswith('.txt')]
     txt_files_dict = {os.path.splitext(os.path.basename(txt_file))[0]: txt_file for txt_file in txt_files}
     updates = []
-    
     if len(uploaded_images) <= 1:
         raise gr.Error(
             "Please upload at least 2 images to train your model (the ideal number with default settings is between 4-30)"
@@ -213,25 +198,8 @@ def load_captioning(uploaded_files, concept_sentence):
         updates.append(gr.update(visible=visible))
 
         # Update for image component - display image if available, otherwise hide
-        if visible:
-            image_path = uploaded_images[i - 1]
-            # Ensure the image exists and is accessible
-            if os.path.exists(image_path):
-                # Read the image using PIL to ensure it's valid
-                try:
-                    img = Image.open(image_path)
-                    # Convert to RGB if needed
-                    if img.mode not in ('RGB', 'RGBA'):
-                        img = img.convert('RGB')
-                    updates.append(gr.update(value=img, visible=True))
-                except Exception as e:
-                    print(f"Error loading image {image_path}: {e}")
-                    updates.append(gr.update(value=None, visible=False))
-            else:
-                print(f"Image path does not exist: {image_path}")
-                updates.append(gr.update(value=None, visible=False))
-        else:
-            updates.append(gr.update(value=None, visible=False))
+        image_value = uploaded_images[i - 1] if visible else None
+        updates.append(gr.update(value=image_value, visible=visible))
 
         corresponding_caption = False
         if visible and i <= len(uploaded_images):
@@ -253,19 +221,6 @@ def load_captioning(uploaded_files, concept_sentence):
 
     # Update for the start button
     updates.append(gr.update(visible=True))
-    
-    # Debug: Count updates by type
-    print(f"DEBUG: Total updates: {len(updates)}")
-    print(f"DEBUG: Number of uploaded images: {len(uploaded_images)}")
-    print(f"DEBUG: Updates breakdown:")
-    print(f"  - captioning_area: 1")
-    print(f"  - image components: {MAX_IMAGES * 4}")
-    print(f"  - start button: 1")
-    print(f"  - Total expected: {1 + MAX_IMAGES * 4 + 1} = 602")
-    
-    # Let's verify we have exactly 4 updates per image
-    updates_per_image = (len(updates) - 2) / MAX_IMAGES  # subtract captioning_area and start
-    print(f"DEBUG: Updates per image: {updates_per_image}")
     
     return updates
 
@@ -1438,7 +1393,7 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
                             locals()[f"captioning_row_{i}"] = gr.Row(visible=False)
                             with locals()[f"captioning_row_{i}"]:
                                 locals()[f"image_{i}"] = gr.Image(
-                                    type="pil",
+                                    type="filepath",
                                     width=111,
                                     height=111,
                                     min_width=111,
@@ -1655,17 +1610,4 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
     refresh.click(update, inputs=listeners, outputs=[train_script, train_config, dataset_folder])
 if __name__ == "__main__":
     cwd = os.path.dirname(os.path.abspath(__file__))
-    
-    # Set Gradio temp directory for better file handling in containers
-    if os.environ.get('GRADIO_TEMP_DIR') is None:
-        os.environ['GRADIO_TEMP_DIR'] = os.path.join(cwd, 'temp')
-        os.makedirs(os.environ['GRADIO_TEMP_DIR'], exist_ok=True)
-    
-    # Launch with proper configuration for RunPod
-    demo.launch(
-        server_name="0.0.0.0", 
-        server_port=7863, 
-        debug=True, 
-        show_error=True, 
-        allowed_paths=[cwd, os.environ.get('GRADIO_TEMP_DIR', '/tmp')]
-    )
+    demo.launch(debug=True, show_error=True, allowed_paths=[cwd])
