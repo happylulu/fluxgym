@@ -175,19 +175,35 @@ def upload_hf(base_model, lora_rows, repo_owner, repo_name, repo_visibility, hf_
     gr.Info(f"[Upload Complete] https://huggingface.co/{repo_id}", duration=None)
 
 def load_captioning(uploaded_files, concept_sentence):
-    uploaded_images = [file for file in uploaded_files if not file.endswith('.txt')]
-    txt_files = [file for file in uploaded_files if file.endswith('.txt')]
+    # Handle both file objects and file paths
+    uploaded_images = []
+    txt_files = []
+    
+    for file in uploaded_files:
+        # Check if it's a file object or a string path
+        if hasattr(file, 'name'):
+            file_path = file.name
+        else:
+            file_path = file
+            
+        if file_path.endswith('.txt'):
+            txt_files.append(file_path)
+        else:
+            uploaded_images.append(file_path)
+    
     txt_files_dict = {os.path.splitext(os.path.basename(txt_file))[0]: txt_file for txt_file in txt_files}
     updates = []
+    
     if len(uploaded_images) <= 1:
         raise gr.Error(
             "Please upload at least 2 images to train your model (the ideal number with default settings is between 4-30)"
         )
     elif len(uploaded_images) > MAX_IMAGES:
         raise gr.Error(f"For now, only {MAX_IMAGES} or less images are allowed for training")
+    
     # Update for the captioning_area
-    # for _ in range(3):
     updates.append(gr.update(visible=True))
+    
     # Update visibility and image for each captioning row and image
     for i in range(1, MAX_IMAGES + 1):
         # Determine if the current row and image should be visible
@@ -197,24 +213,46 @@ def load_captioning(uploaded_files, concept_sentence):
         updates.append(gr.update(visible=visible))
 
         # Update for image component - display image if available, otherwise hide
-        image_value = uploaded_images[i - 1] if visible else None
-        updates.append(gr.update(value=image_value, visible=visible))
+        if visible:
+            image_path = uploaded_images[i - 1]
+            # Ensure the image exists and is accessible
+            if os.path.exists(image_path):
+                # Read the image using PIL to ensure it's valid
+                try:
+                    from PIL import Image
+                    img = Image.open(image_path)
+                    # Convert to RGB if needed
+                    if img.mode not in ('RGB', 'RGBA'):
+                        img = img.convert('RGB')
+                    updates.append(gr.update(value=img, visible=True))
+                except Exception as e:
+                    print(f"Error loading image {image_path}: {e}")
+                    updates.append(gr.update(value=None, visible=False))
+            else:
+                print(f"Image path does not exist: {image_path}")
+                updates.append(gr.update(value=None, visible=False))
+        else:
+            updates.append(gr.update(value=None, visible=False))
 
         corresponding_caption = False
-        if(image_value):
-            base_name = os.path.splitext(os.path.basename(image_value))[0]
+        if visible and i <= len(uploaded_images):
+            image_path = uploaded_images[i - 1]
+            base_name = os.path.splitext(os.path.basename(image_path))[0]
             if base_name in txt_files_dict:
-                with open(txt_files_dict[base_name], 'r') as file:
-                    corresponding_caption = file.read()
+                try:
+                    with open(txt_files_dict[base_name], 'r') as file:
+                        corresponding_caption = file.read()
+                except Exception as e:
+                    print(f"Error reading caption file: {e}")
 
         # Update value of captioning area
         text_value = corresponding_caption if visible and corresponding_caption else concept_sentence if visible and concept_sentence else None
         updates.append(gr.update(value=text_value, visible=visible))
         
-        # Update for caption_stats component - this was missing!
+        # Update for caption_stats component
         updates.append(gr.update(visible=visible))
 
-    # Update for the sample caption area
+    # Update for the start button area
     updates.append(gr.update(visible=True))
     updates.append(gr.update(visible=True))
 
@@ -1389,7 +1427,7 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
                             locals()[f"captioning_row_{i}"] = gr.Row(visible=False)
                             with locals()[f"captioning_row_{i}"]:
                                 locals()[f"image_{i}"] = gr.Image(
-                                    type="filepath",
+                                    type="pil",
                                     width=111,
                                     height=111,
                                     min_width=111,
@@ -1606,4 +1644,17 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
     refresh.click(update, inputs=listeners, outputs=[train_script, train_config, dataset_folder])
 if __name__ == "__main__":
     cwd = os.path.dirname(os.path.abspath(__file__))
-    demo.launch(debug=True, show_error=True, allowed_paths=[cwd])
+    
+    # Set Gradio temp directory for better file handling in containers
+    if os.environ.get('GRADIO_TEMP_DIR') is None:
+        os.environ['GRADIO_TEMP_DIR'] = os.path.join(cwd, 'temp')
+        os.makedirs(os.environ['GRADIO_TEMP_DIR'], exist_ok=True)
+    
+    # Launch with proper configuration for RunPod
+    demo.launch(
+        server_name="0.0.0.0", 
+        server_port=7863, 
+        debug=True, 
+        show_error=True, 
+        allowed_paths=[cwd, os.environ.get('GRADIO_TEMP_DIR', '/tmp')]
+    )
