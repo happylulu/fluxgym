@@ -252,8 +252,7 @@ def load_captioning(uploaded_files, concept_sentence):
         # Update for caption_stats component
         updates.append(gr.update(visible=visible))
 
-    # Update for the start button area
-    updates.append(gr.update(visible=True))
+    # Update for the start button
     updates.append(gr.update(visible=True))
 
     return updates
