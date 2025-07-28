@@ -190,7 +190,9 @@ def load_captioning(uploaded_files, concept_sentence):
     updates.append(gr.update(visible=True))
     
     # Update visibility and image for each captioning row and image
+    count = 0
     for i in range(1, MAX_IMAGES + 1):
+        count += 1
         # Determine if the current row and image should be visible
         visible = i <= len(uploaded_images)
 
@@ -221,6 +223,9 @@ def load_captioning(uploaded_files, concept_sentence):
 
     # Update for the start button
     updates.append(gr.update(visible=True))
+    
+    print(f"DEBUG: Loop ran {count} times (should be {MAX_IMAGES})")
+    print(f"DEBUG: Total updates: {len(updates)} (should be {1 + MAX_IMAGES * 4 + 1})")
     
     return updates
 
